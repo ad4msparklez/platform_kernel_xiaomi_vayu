@@ -37,7 +37,6 @@
 
 #include <trace/events/thermal.h>
 
-#define USE_LMH_DEV	0
 /*
  * Cooling state <-> CPUFreq frequency
  *
@@ -281,6 +280,16 @@ static int cpufreq_hp_online(unsigned int online_cpu)
 	return ret;
 }
 
+static bool use_mithermal = true;
+static int __init early_mode_mithermal(char *mode)
+{
+	if (mode && !strcmp(mode, "0"))
+		use_mithermal = false;
+
+	return 0;
+}
+early_param("mithermal.enabled", early_mode_mithermal);
+
 
 /**
  * cpufreq_thermal_notifier - notifier callback for cpufreq policy change.
@@ -332,7 +341,12 @@ static int cpufreq_thermal_notifier(struct notifier_block *nb,
 	 * Similarly, if policy minimum set by the user is less than
 	 * the floor_frequency, then adjust the policy->min.
 	 */
-	cpufreq_verify_within_limits(policy, floor_freq, clipped_freq);
+	if (use_mithermal) {
+		cpufreq_verify_within_limits(policy, floor_freq, clipped_freq);
+	} else if (policy->max > clipped_freq || policy->min < floor_freq) {
+		cpufreq_verify_within_limits(policy, floor_freq, clipped_freq);
+	}
+
 	mutex_unlock(&cooling_list_lock);
 
 	return NOTIFY_OK;
@@ -344,6 +358,9 @@ void cpu_limits_set_level(unsigned int cpu, unsigned int max_freq)
 	struct thermal_cooling_device *cdev;
 	unsigned int cdev_cpu;
 	unsigned int level;
+
+	if (!use_mithermal)
+		return; // pixel hal does not handle this manually
 
 	list_for_each_entry(cpufreq_cdev, &cpufreq_cdev_list, node) {
 		sscanf(cpufreq_cdev->cdev->type, "thermal-cpufreq-%d", &cdev_cpu);
@@ -699,8 +716,12 @@ static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
 	int cpu = 0;
 
 	/* Request state should be less than max_level */
-	if (WARN_ON(state > cpufreq_cdev->max_level))
+	if (WARN_ON(state > cpufreq_cdev->max_level)) {
+		if (!use_mithermal)
+			return -EINVAL;
+
 		state = cpufreq_cdev->max_level;
+	}
 
 	/* Check if the old cooling action is same as new cooling action */
 	if (cpufreq_cdev->cpufreq_state == state)
@@ -750,7 +771,7 @@ update_frequency:
 	 * can handle the CPU freq mitigation, if not, notify cpufreq
 	 * framework.
 	 */
-	if (USE_LMH_DEV && cpufreq_cdev->plat_ops) {
+	if (!use_mithermal && cpufreq_cdev->plat_ops) {
 		if (cpufreq_cdev->plat_ops->ceil_limit)
 			cpufreq_cdev->plat_ops->ceil_limit(cpu,
 						clip_freq);
@@ -1115,7 +1136,7 @@ __cpufreq_cooling_register(struct device_node *np,
 	list_add(&cpufreq_cdev->node, &cpufreq_cdev_list);
 	mutex_unlock(&cooling_list_lock);
 
-	if (first)
+	if (first && (use_mithermal || !cpufreq_cdev->plat_ops))
 		cpufreq_register_notifier(&thermal_cpufreq_notifier_block,
 					  CPUFREQ_POLICY_NOTIFIER);
 	if (!cpuhp_registered) {
@@ -1308,6 +1329,7 @@ void cpufreq_cooling_unregister(struct thermal_cooling_device *cdev)
 
 	if (last) {
 		unregister_pm_notifier(&cpufreq_cooling_pm_nb);
+		if (use_mithermal || !cpufreq_cdev->plat_ops)
 			cpufreq_unregister_notifier(
 					&thermal_cpufreq_notifier_block,
 					CPUFREQ_POLICY_NOTIFIER);
